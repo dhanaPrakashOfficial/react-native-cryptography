@@ -1,0 +1,1192 @@
+import React, { useState } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  ScrollView,
+  StyleSheet,
+  Alert,
+  Platform,
+  PermissionsAndroid,
+} from 'react-native';
+import { gcm } from '@noble/ciphers/aes';
+import * as RNFS from 'react-native-fs';
+import { pick, types, errorCodes, isErrorWithCode } from '@react-native-documents/picker';
+
+// Polyfill for React Native if needed
+if (typeof global.crypto === 'undefined') {
+  // @ts-ignore
+  global.crypto = {
+    getRandomValues: (arr: Uint8Array) => {
+      for (let i = 0; i < arr.length; i++) {
+        arr[i] = Math.floor(Math.random() * 256);
+      }
+      return arr;
+    },
+  };
+}
+
+// Random bytes generator for React Native
+const randomBytes = (length: number): Uint8Array => {
+  const bytes = new Uint8Array(length);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return bytes;
+};
+
+// Base64 utilities
+const bytesToBase64 = (bytes: Uint8Array): string => {
+  const binary = Array.from(bytes)
+    .map((b) => String.fromCharCode(b))
+    .join('');
+  return btoa(binary);
+};
+
+const base64ToBytes = (base64: string): Uint8Array => {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+};
+
+const bytesToHex = (bytes: Uint8Array): string => {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+};
+
+// Text encoding/decoding (simple 1-byte-per-char)
+const stringToBytes = (str: string): Uint8Array => {
+  const bytes = new Uint8Array(str.length);
+  for (let i = 0; i < str.length; i++) {
+    bytes[i] = str.charCodeAt(i);
+  }
+  return bytes;
+};
+
+const bytesToString = (bytes: Uint8Array): string => {
+  return Array.from(bytes)
+    .map((b) => String.fromCharCode(b))
+    .join('');
+};
+
+// Build .bin format => [12-byte nonce][ciphertext+tag]
+const buildBinFile = (nonce: Uint8Array, ciphertextAndTag: Uint8Array): Uint8Array => {
+  const result = new Uint8Array(nonce.length + ciphertextAndTag.length);
+  result.set(nonce, 0);
+  result.set(ciphertextAndTag, nonce.length);
+  return result;
+};
+
+// Parse .bin bytes => nonce, ciphertext, tag, ciphertextAndTag
+const parseBinBytes = (bytes: Uint8Array) => {
+  if (bytes.length < 12 + 16) {
+    throw new Error('Invalid .bin data: too small');
+  }
+
+  const nonce = bytes.slice(0, 12);
+  const ciphertextAndTag = bytes.slice(12);
+  const tag = ciphertextAndTag.slice(ciphertextAndTag.length - 16);
+  const ciphertext = ciphertextAndTag.slice(0, ciphertextAndTag.length - 16);
+
+  return {
+    nonce,
+    ciphertext,
+    tag,
+    ciphertextAndTag,
+  };
+};
+
+// Build payload for media file => [nameLen(2 bytes)][nameBytes][fileBytes]
+// This payload is what gets encrypted (so .bin outer format is still [nonce][ciphertext][tag])
+const buildFilePayload = (fileName: string, fileBytes: Uint8Array): Uint8Array => {
+  const safeName = fileName || 'encrypted_file';
+  const nameBytes = stringToBytes(safeName);
+  let nameLen = nameBytes.length;
+  if (nameLen > 65535) {
+    nameLen = 65535;
+  }
+
+  const payload = new Uint8Array(2 + nameLen + fileBytes.length);
+  // 2-byte big-endian length
+  payload[0] = (nameLen >> 8) & 0xff;
+  payload[1] = nameLen & 0xff;
+  payload.set(nameBytes.slice(0, nameLen), 2);
+  payload.set(fileBytes, 2 + nameLen);
+
+  return payload;
+};
+
+// Parse decrypted payload back into filename + file bytes
+const parseFilePayload = (payload: Uint8Array) => {
+  if (payload.length < 3) {
+    throw new Error('Decrypted payload too small to contain file header');
+  }
+  const nameLen = (payload[0] << 8) | payload[1];
+  if (nameLen <= 0 || nameLen > 4096) {
+    throw new Error(
+      'This encrypted data does not contain a valid file header (filename length out of range)'
+    );
+  }
+  if (payload.length < 2 + nameLen + 1) {
+    throw new Error('Decrypted payload too small to contain filename and file data');
+  }
+
+  const nameBytes = payload.slice(2, 2 + nameLen);
+  const fileBytes = payload.slice(2 + nameLen);
+  const fileName = bytesToString(nameBytes).trim() || 'decrypted_file.bin';
+
+  return { fileName, fileBytes };
+};
+
+// AES-256-GCM encryption using @noble/ciphers for TEXT (string input)
+const gcmEncrypt = (
+  plaintext: string,
+  keyBytes: Uint8Array,
+  nonceBytes: Uint8Array
+): { combined: Uint8Array; ciphertext: Uint8Array; tag: Uint8Array } => {
+  const data = stringToBytes(plaintext);
+  const cipher = gcm(keyBytes, nonceBytes);
+  const encrypted = cipher.encrypt(data);
+
+  const tagLength = 16;
+  const ciphertext = encrypted.slice(0, encrypted.length - tagLength);
+  const tag = encrypted.slice(encrypted.length - tagLength);
+
+  return {
+    combined: encrypted,
+    ciphertext,
+    tag,
+  };
+};
+
+// AES-256-GCM encryption for BYTES (media files)
+const gcmEncryptBytes = (
+  data: Uint8Array,
+  keyBytes: Uint8Array,
+  nonceBytes: Uint8Array
+): { combined: Uint8Array; tag: Uint8Array } => {
+  const cipher = gcm(keyBytes, nonceBytes);
+  const encrypted = cipher.encrypt(data);
+  const tag = encrypted.slice(encrypted.length - 16);
+  return { combined: encrypted, tag };
+};
+
+const gcmDecrypt = (
+  ciphertextWithTag: Uint8Array,
+  keyBytes: Uint8Array,
+  nonceBytes: Uint8Array
+): Uint8Array => {
+  const cipher = gcm(keyBytes, nonceBytes);
+  const decrypted = cipher.decrypt(ciphertextWithTag);
+  return decrypted;
+};
+
+// Request Android storage permissions for Downloads folder
+const requestStoragePermissions = async (): Promise<boolean> => {
+  if (Platform.OS !== 'android') return true;
+
+  try {
+    const apiLevel = Platform.Version as number;
+
+    if (apiLevel >= 30) {
+      // Android 11+ - rely on scoped storage + DownloadDirectoryPath
+      return true;
+    } else {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE,
+        {
+          title: 'Storage Permission',
+          message: 'This app needs access to your storage to save encrypted/decrypted files.',
+          buttonPositive: 'OK',
+        }
+      );
+      return granted === PermissionsAndroid.RESULTS.GRANTED;
+    }
+  } catch (err) {
+    console.log('⚠️ Error requesting storage permission:', err);
+    return false;
+  }
+};
+
+// Save file to Downloads (Android) or Documents (iOS). Data is base64 of original file bytes.
+const saveToDownloads = async (filename: string, base64Data: string): Promise<string | null> => {
+  try {
+    if (Platform.OS === 'android') {
+      let downloadsPath = RNFS.DownloadDirectoryPath;
+
+      if (!downloadsPath && RNFS.ExternalStorageDirectoryPath) {
+        downloadsPath = RNFS.ExternalStorageDirectoryPath + '/Download';
+      }
+
+      if (!downloadsPath) {
+        throw new Error('Downloads directory is not available on this device');
+      }
+
+      let safeName = filename || 'file.bin';
+      // Remove any path parts a malicious filename could contain
+      safeName = safeName.replace(/[/\\]/g, '_');
+
+      let filePath = `${downloadsPath}/${safeName}`;
+      let finalPath = filePath;
+
+      const exists = await RNFS.exists(filePath);
+      if (exists) {
+        const timestamp = Date.now();
+        const dotIndex = safeName.lastIndexOf('.');
+        if (dotIndex > 0) {
+          const base = safeName.slice(0, dotIndex);
+          const ext = safeName.slice(dotIndex);
+          safeName = `${base}_${timestamp}${ext}`;
+        } else {
+          safeName = `${safeName}_${timestamp}`;
+        }
+        finalPath = `${downloadsPath}/${safeName}`;
+      }
+
+      console.log(`📁 Saving to Downloads: ${finalPath}`);
+      await RNFS.writeFile(finalPath, base64Data, 'base64');
+
+      try {
+        // @ts-ignore - type defs may differ
+        await RNFS.scanFile(finalPath);
+      } catch (scanErr) {
+        console.log('⚠️ scanFile failed (non-critical):', scanErr);
+      }
+
+      return finalPath;
+    } else {
+      const docsPath = RNFS.DocumentDirectoryPath;
+      let safeName = filename || 'file.bin';
+      safeName = safeName.replace(/[/\\]/g, '_');
+
+      const filePath = `${docsPath}/${safeName}`;
+      await RNFS.writeFile(filePath, base64Data, 'base64');
+      console.log(`✅ File saved to iOS Documents: ${filePath}`);
+      return filePath;
+    }
+  } catch (error) {
+    console.error('❌ Error saving to Downloads/Documents:', error);
+
+    try {
+      const privatePath = RNFS.DocumentDirectoryPath;
+      const fallbackPath = `${privatePath}/${filename || 'file.bin'}`;
+      await RNFS.writeFile(fallbackPath, base64Data, 'base64');
+      console.log(`✅ File saved to fallback location: ${fallbackPath}`);
+      return fallbackPath;
+    } catch (fallbackError) {
+      console.error('❌ Fallback save also failed:', fallbackError);
+      return null;
+    }
+  }
+};
+
+// Save encrypted .bin file (wrapper for saveToDownloads) with encrypted_{timestamp}.bin
+const saveEncryptedBinFile = async (binBase64: string): Promise<string | null> => {
+  try {
+    const timestamp = Date.now();
+    const filename = `encrypted_${timestamp}.bin`;
+
+    if (Platform.OS === 'android') {
+      const hasPermission = await requestStoragePermissions();
+      if (!hasPermission) {
+        Alert.alert(
+          'Permission Required',
+          'Storage permission is required to save files to Downloads folder.'
+        );
+        return null;
+      }
+    }
+
+    const savedPath = await saveToDownloads(filename, binBase64);
+
+    if (savedPath) {
+      const displayName = savedPath.split('/').pop() || filename;
+      Alert.alert(
+        'Encrypted File Saved',
+        `Encrypted .bin file saved as:\n${displayName}\n\nLocation:\n${savedPath}`
+      );
+      return savedPath;
+    } else {
+      Alert.alert('Error', 'Failed to save the encrypted .bin file.');
+      return null;
+    }
+  } catch (error: any) {
+    Alert.alert('Error', error.message || 'Failed to save the encrypted .bin file.');
+    return null;
+  }
+};
+
+// ✅ Resolve picker file to a real local path RNFS can read (fixes content:// crash)
+const resolveFileUri = async (file: any): Promise<string> => {
+  let uri: string = file.fileCopyUri || file.uri;
+
+  // If it's already a file path, just return it
+  if (!uri.startsWith('content://')) {
+    return uri;
+  }
+
+  // For content:// URIs, copy into app's document directory
+  const safeName =
+    (file.name as string | undefined)?.replace(/[/\\]/g, '_') ||
+    `picked_${Date.now()}.bin`;
+
+  const destPath = `${RNFS.DocumentDirectoryPath}/${safeName}`;
+
+  console.log('📎 Copying content URI to local path:', uri, '→', destPath);
+
+  await RNFS.copyFile(uri, destPath);
+
+  return destPath;
+};
+
+const AesGcmScreen = () => {
+  const [mode, setMode] = useState<'encrypt' | 'decrypt'>('encrypt');
+  const [inputText, setInputText] = useState('');
+  const [key, setKey] = useState('');
+  const [nonce, setNonce] = useState('');
+  const [output, setOutput] = useState('');
+  const [tagDisplay, setTagDisplay] = useState('');
+  const [binOutput, setBinOutput] = useState('');
+  const [binFilePath, setBinFilePath] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+
+  const validateKey = (keyInput: string): boolean => {
+    try {
+      const decoded = base64ToBytes(keyInput);
+      return decoded.length === 32;
+    } catch {
+      return false;
+    }
+  };
+
+  const validateNonce = (nonceInput: string): boolean => {
+    try {
+      const decoded = base64ToBytes(nonceInput);
+      return decoded.length === 12;
+    } catch {
+      return false;
+    }
+  };
+
+  const generateRandomKey = () => {
+    const keyBytes = randomBytes(32);
+    const base64Key = bytesToBase64(keyBytes);
+    setKey(base64Key);
+  };
+
+  const generateRandomNonce = () => {
+    const nonceBytes = randomBytes(12);
+    const base64Nonce = bytesToBase64(nonceBytes);
+    setNonce(base64Nonce);
+  };
+
+  // Import a .bin file, parse it and fill nonce + ciphertext+tag
+  const handleImportBin = async () => {
+    try {
+      const [file] = await pick({
+        type: [types.allFiles],
+      });
+
+      if (!file) {
+        return;
+      }
+
+      // ✅ Use safe path
+      const resolvedPath = await resolveFileUri(file);
+
+      const fileBase64 = await RNFS.readFile(resolvedPath, 'base64');
+      const fileBytes = base64ToBytes(fileBase64);
+
+      const parsed = parseBinBytes(fileBytes);
+
+      const nonceB64 = bytesToBase64(parsed.nonce);
+      const ctPlusTagB64 = bytesToBase64(parsed.ciphertextAndTag);
+      const tagB64 = bytesToBase64(parsed.tag);
+      const tagHex = bytesToHex(parsed.tag);
+
+      setMode('decrypt');
+      setNonce(nonceB64);
+      setInputText(ctPlusTagB64);
+      setOutput('');
+      setBinOutput(fileBase64);
+      setBinFilePath(resolvedPath);
+      setTagDisplay(
+        `Extracted from .bin:\n` +
+          `Nonce (Base64): ${nonceB64}\n` +
+          `Tag (Base64): ${tagB64}\nTag (Hex): ${tagHex}\n\n` +
+          `Ciphertext+Tag Length: ${parsed.ciphertextAndTag.length} bytes`
+      );
+
+      Alert.alert('Success', '.bin file loaded and parsed successfully');
+    } catch (err: any) {
+      if (isErrorWithCode(err) && err.code === errorCodes.OPERATION_CANCELED) {
+        return;
+      }
+      console.log('❌ BIN Import Error:', err);
+      Alert.alert('Error', err.message || 'Failed to import .bin file');
+    }
+  };
+
+  // Encrypt a media file (any file) into .bin with embedded filename
+  const handleEncryptMediaFile = async () => {
+    try {
+      if (!validateKey(key)) {
+        Alert.alert(
+          'Error',
+          'Key must be a valid Base64 string representing 32 bytes (256 bits).'
+        );
+        return;
+      }
+
+      if (!validateNonce(nonce)) {
+        Alert.alert(
+          'Error',
+          'Nonce/IV must be a valid Base64 string representing 12 bytes (96 bits).'
+        );
+        return;
+      }
+
+      const [file] = await pick({
+        type: [types.allFiles],
+      });
+
+      if (!file) return;
+
+      setIsProcessing(true);
+      setOutput('');
+      setTagDisplay('');
+      setBinOutput('');
+      setBinFilePath('');
+
+      const resolvedPath = await resolveFileUri(file);
+      const originalName =
+        (file as any).name ||
+        resolvedPath.split('/').pop() ||
+        'encrypted_file.bin';
+
+      const fileBase64 = await RNFS.readFile(resolvedPath, 'base64');
+      const fileBytes = base64ToBytes(fileBase64);
+
+      let processedKey = base64ToBytes(key);
+      let processedNonce = base64ToBytes(nonce);
+
+      if (processedKey.length !== 32) {
+        const fullKey = new Uint8Array(32);
+        fullKey.set(processedKey.slice(0, 32));
+        processedKey = fullKey;
+      }
+
+      if (processedNonce.length !== 12) {
+        const fullNonce = new Uint8Array(12);
+        fullNonce.set(processedNonce.slice(0, 12));
+        processedNonce = fullNonce;
+      }
+
+      // Build payload [nameLen][nameBytes][fileBytes], then encrypt
+      const payload = buildFilePayload(originalName, fileBytes);
+      const enc = gcmEncryptBytes(payload, processedKey, processedNonce);
+
+      const binBytes = buildBinFile(processedNonce, enc.combined);
+      const binBase64 = bytesToBase64(binBytes);
+      setBinOutput(binBase64);
+
+      const savedPath = await saveEncryptedBinFile(binBase64);
+      if (savedPath) {
+        setBinFilePath(savedPath);
+      }
+
+      const tagBase64 = bytesToBase64(enc.tag);
+      const tagHex = bytesToHex(enc.tag);
+      setTagDisplay(
+        `Media file encrypted.\nOriginal name: ${originalName}\n\nTag:\nBase64: ${tagBase64}\nHex: ${tagHex}`
+      );
+
+      Alert.alert(
+        'Media Encrypted',
+        `File "${originalName}" has been encrypted into a .bin file.\nIt contains the original filename inside and can be decrypted back.`
+      );
+    } catch (err: any) {
+      console.log('❌ Media Encrypt Error:', err);
+      Alert.alert('Error', err.message || 'Failed to encrypt media file.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // Decrypt current ciphertext (from .bin) as media file, restore original name & save to Downloads
+  const handleDecryptMediaFile = async () => {
+    try {
+      if (mode !== 'decrypt') {
+        Alert.alert('Error', 'Switch to Decrypt mode to decrypt a media file.');
+        return;
+      }
+
+      if (!inputText.trim()) {
+        Alert.alert('Error', 'No encrypted data loaded. Import a .bin file first.');
+        return;
+      }
+
+      if (!validateKey(key)) {
+        Alert.alert(
+          'Error',
+          'Key must be a valid Base64 string representing 32 bytes (256 bits).'
+        );
+        return;
+      }
+
+      if (!validateNonce(nonce)) {
+        Alert.alert(
+          'Error',
+          'Nonce/IV must be a valid Base64 string representing 12 bytes (96 bits).'
+        );
+        return;
+      }
+
+      setIsProcessing(true);
+
+      let processedKey = base64ToBytes(key);
+      let processedNonce = base64ToBytes(nonce);
+
+      if (processedKey.length !== 32) {
+        const fullKey = new Uint8Array(32);
+        fullKey.set(processedKey.slice(0, 32));
+        processedKey = fullKey;
+      }
+
+      if (processedNonce.length !== 12) {
+        const fullNonce = new Uint8Array(12);
+        fullNonce.set(processedNonce.slice(0, 12));
+        processedNonce = fullNonce;
+      }
+
+      const ciphertextWithTag = base64ToBytes(inputText);
+      if (ciphertextWithTag.length < 16) {
+        throw new Error('Invalid ciphertext: too short (missing authentication tag).');
+      }
+
+      const payload = gcmDecrypt(ciphertextWithTag, processedKey, processedNonce);
+
+      const { fileName, fileBytes } = parseFilePayload(payload);
+
+      if (Platform.OS === 'android') {
+        const hasPermission = await requestStoragePermissions();
+        if (!hasPermission) {
+          Alert.alert(
+            'Permission Required',
+            'Storage permission is required to save decrypted files to Downloads.'
+          );
+          return;
+        }
+      }
+
+      const base64File = bytesToBase64(fileBytes);
+      const savedPath = await saveToDownloads(fileName, base64File);
+
+      if (!savedPath) {
+        throw new Error('Failed to save decrypted file to Downloads/Documents.');
+      }
+
+      setBinFilePath(savedPath);
+      setOutput('');
+      setTagDisplay(`Decrypted media file saved as:\n${fileName}\nPath:\n${savedPath}`);
+
+      Alert.alert(
+        'Media Decrypted',
+        `Decrypted file saved as:\n${fileName}\n\nLocation:\n${savedPath}`
+      );
+    } catch (err: any) {
+      console.log('❌ Media Decrypt Error:', err);
+      Alert.alert('Error', err.message || 'Failed to decrypt media file.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // Text encrypt/decrypt (existing flow)
+  const handleProcess = async () => {
+    if (!inputText.trim()) {
+      Alert.alert('Error', `Please enter text to ${mode}`);
+      return;
+    }
+
+    if (!validateKey(key)) {
+      Alert.alert(
+        'Error',
+        'Key must be a valid Base64 string representing 32 bytes (256 bits)'
+      );
+      return;
+    }
+
+    if (!validateNonce(nonce)) {
+      Alert.alert(
+        'Error',
+        'Nonce/IV must be a valid Base64 string representing 12 bytes (96 bits)'
+      );
+      return;
+    }
+
+    setIsProcessing(true);
+    setOutput('');
+    setTagDisplay('');
+    setBinOutput('');
+    setBinFilePath('');
+
+    try {
+      let processedKey = base64ToBytes(key);
+      let processedNonce = base64ToBytes(nonce);
+
+      if (processedKey.length !== 32) {
+        const fullKey = new Uint8Array(32);
+        fullKey.set(processedKey.slice(0, 32));
+        processedKey = fullKey;
+      }
+
+      if (processedNonce.length !== 12) {
+        const fullNonce = new Uint8Array(12);
+        fullNonce.set(processedNonce.slice(0, 12));
+        processedNonce = fullNonce;
+      }
+
+      if (mode === 'encrypt') {
+        const result = gcmEncrypt(inputText, processedKey, processedNonce);
+
+        const base64Output = bytesToBase64(result.combined);
+        setOutput(base64Output);
+
+        const tagBase64 = bytesToBase64(result.tag);
+        const tagHex = bytesToHex(result.tag);
+        setTagDisplay(
+          `Base64: ${tagBase64}\nHex: ${tagHex}\n\n✓ Tag is automatically appended to ciphertext`
+        );
+
+        const binBytes = buildBinFile(processedNonce, result.combined);
+        const binBase64 = bytesToBase64(binBytes);
+        setBinOutput(binBase64);
+
+        const savedPath = await saveEncryptedBinFile(binBase64);
+        if (savedPath) {
+          setBinFilePath(savedPath);
+        }
+      } else {
+        const ciphertextWithTag = base64ToBytes(inputText);
+
+        if (ciphertextWithTag.length < 16) {
+          throw new Error('Invalid ciphertext: too short (missing authentication tag)');
+        }
+
+        const plaintext = gcmDecrypt(ciphertextWithTag, processedKey, processedNonce);
+        const outputText = bytesToString(plaintext);
+        setOutput(outputText);
+
+        const tag = ciphertextWithTag.slice(ciphertextWithTag.length - 16);
+        const tagBase64 = bytesToBase64(tag);
+        const tagHex = bytesToHex(tag);
+        setTagDisplay(
+          `Extracted Tag:\nBase64: ${tagBase64}\nHex: ${tagHex}\n\n✓ Tag verified successfully`
+        );
+      }
+    } catch (err: any) {
+      Alert.alert('Error', err.message || 'Operation failed');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const clearAll = () => {
+    setInputText('');
+    setKey('');
+    setNonce('');
+    setOutput('');
+    setTagDisplay('');
+    setBinOutput('');
+    setBinFilePath('');
+  };
+
+  return (
+    <ScrollView style={styles.container}>
+      <View style={styles.content}>
+        <Text style={styles.title}>🔐 AES-256-GCM Encryption</Text>
+        <Text style={styles.subtitle}>Text + Media (.bin in Downloads)</Text>
+
+        {/* Mode Toggle */}
+        <View style={styles.modeContainer}>
+          <Text style={styles.modeLabel}>Mode:</Text>
+          <View style={styles.modeToggle}>
+            <TouchableOpacity
+              style={[styles.modeButton, mode === 'encrypt' && styles.modeButtonActive]}
+              onPress={() => setMode('encrypt')}
+            >
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  mode === 'encrypt' && styles.modeButtonTextActive,
+                ]}
+              >
+                Encrypt
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.modeButton, mode === 'decrypt' && styles.modeButtonActive]}
+              onPress={() => setMode('decrypt')}
+            >
+              <Text
+                style={[
+                  styles.modeButtonText,
+                  mode === 'decrypt' && styles.modeButtonTextActive,
+                ]}
+              >
+                Decrypt
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        {/* Media Encrypt Button (Encrypt mode only) */}
+        {mode === 'encrypt' && (
+          <TouchableOpacity
+            style={[styles.importButton, { backgroundColor: '#0f766e' }]}
+            onPress={handleEncryptMediaFile}
+            disabled={isProcessing}
+          >
+            <Text style={styles.buttonText}>📄 Encrypt Media File (to .bin)</Text>
+          </TouchableOpacity>
+        )}
+
+        {/* Import BIN Button */}
+        <TouchableOpacity
+          style={[styles.importButton, { marginBottom: mode === 'decrypt' ? 10 : 20 }]}
+          onPress={handleImportBin}
+          disabled={isProcessing}
+        >
+          <Text style={styles.buttonText}>📥 Import .bin File</Text>
+        </TouchableOpacity>
+
+        {/* Decrypt .bin to File (media) - only in decrypt mode */}
+        {mode === 'decrypt' && inputText ? (
+          <TouchableOpacity
+            style={[
+              styles.importButton,
+              { backgroundColor: '#22c55e', marginBottom: 20 },
+            ]}
+            onPress={handleDecryptMediaFile}
+            disabled={isProcessing}
+          >
+            <Text style={styles.buttonText}>📂 Decrypt .bin to File (Downloads)</Text>
+          </TouchableOpacity>
+        ) : null}
+
+        {/* Input Text */}
+        <View style={styles.inputGroup}>
+          <Text style={styles.label}>
+            {mode === 'encrypt' ? 'Plain Text:' : 'Encrypted Text (Base64 with Tag):'}
+          </Text>
+          <TextInput
+            style={styles.textArea}
+            value={inputText}
+            onChangeText={setInputText}
+            placeholder={
+              mode === 'encrypt'
+                ? 'Enter text to encrypt...'
+                : 'Paste encrypted text (includes 16-byte tag)...'
+            }
+            placeholderTextColor="#9ca3af"
+            multiline
+            numberOfLines={4}
+            editable={!isProcessing}
+          />
+        </View>
+
+        {/* Key Input */}
+        <View style={styles.inputGroup}>
+          <View style={styles.labelRow}>
+            <Text style={styles.label}>256-bit Key (Base64, 32 bytes):</Text>
+            <TouchableOpacity
+              style={styles.smallButton}
+              onPress={generateRandomKey}
+              disabled={isProcessing}
+            >
+              <Text style={styles.smallButtonText}>Generate</Text>
+            </TouchableOpacity>
+          </View>
+          <TextInput
+            style={styles.input}
+            value={key}
+            onChangeText={setKey}
+            placeholder="e.g., AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+            placeholderTextColor="#9ca3af"
+            editable={!isProcessing}
+          />
+          <Text style={[styles.hint, validateKey(key) ? styles.validHint : styles.invalidHint]}>
+            {key
+              ? `${Math.ceil((key.length * 3) / 4)} bytes - ${
+                  validateKey(key) ? '✓ Valid' : '✗ Invalid (needs 32 bytes)'
+                }`
+              : 'Enter 32-byte base64 key'}
+          </Text>
+        </View>
+
+        {/* Nonce Input */}
+        <View style={styles.inputGroup}>
+          <View style={styles.labelRow}>
+            <Text style={styles.label}>Nonce/IV (Base64, 12 bytes):</Text>
+            <TouchableOpacity
+              style={styles.smallButton}
+              onPress={generateRandomNonce}
+              disabled={isProcessing}
+            >
+              <Text style={styles.smallButtonText}>Generate</Text>
+            </TouchableOpacity>
+          </View>
+          <TextInput
+            style={styles.input}
+            value={nonce}
+            onChangeText={setNonce}
+            placeholder="e.g., AQIDBAUGBwgJCgsM"
+            placeholderTextColor="#9ca3af"
+            editable={!isProcessing}
+          />
+          <Text
+            style={[styles.hint, validateNonce(nonce) ? styles.validHint : styles.invalidHint]}
+          >
+            {nonce
+              ? `${Math.ceil((nonce.length * 3) / 4)} bytes - ${
+                  validateNonce(nonce) ? '✓ Valid' : '✗ Invalid (needs 12 bytes)'
+                }`
+              : 'Enter 12-byte base64 nonce'}
+          </Text>
+        </View>
+
+        {/* Action Buttons (Text encrypt/decrypt) */}
+        <View style={styles.buttonRow}>
+          <TouchableOpacity
+            style={[styles.processButton, isProcessing && styles.disabledButton]}
+            onPress={handleProcess}
+            disabled={isProcessing}
+          >
+            <Text style={styles.buttonText}>
+              {isProcessing
+                ? '⏳ Processing...'
+                : mode === 'encrypt'
+                ? '🔒 Encrypt Text & Save .bin'
+                : '🔓 Decrypt Text'}
+            </Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.clearButton}
+            onPress={clearAll}
+            disabled={isProcessing}
+          >
+            <Text style={styles.buttonText}>Clear All</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Output */}
+        {output ? (
+          <View style={styles.outputContainer}>
+            <Text style={styles.outputLabel}>
+              {mode === 'encrypt' ? 'Encrypted Output (Base64):' : 'Decrypted Output:'}
+            </Text>
+            <View style={styles.outputBox}>
+              <Text selectable style={styles.outputText}>
+                {output}
+              </Text>
+            </View>
+          </View>
+        ) : null}
+
+        {/* BIN Output (preview) */}
+        {binOutput ? (
+          <View style={styles.outputContainer}>
+            <Text style={styles.outputLabel}>.bin Content (Base64 preview):</Text>
+            <View style={styles.outputBox}>
+              <Text selectable style={styles.outputText}>
+                {binOutput.substring(0, 120)}...
+              </Text>
+            </View>
+            {binFilePath ? (
+              <Text style={styles.filePath}>📍 Saved to: {binFilePath}</Text>
+            ) : null}
+          </View>
+        ) : null}
+
+        {/* Tag Display */}
+        {tagDisplay ? (
+          <View style={styles.tagContainer}>
+            <Text style={styles.tagLabel}>🏷️ Authentication Tag / Info:</Text>
+            <View style={styles.tagBox}>
+              <Text selectable style={styles.tagText}>
+                {tagDisplay}
+              </Text>
+            </View>
+          </View>
+        ) : null}
+
+        {/* Info Section */}
+        <View style={styles.infoContainer}>
+          <Text style={styles.infoTitle}>📋 About This Tool</Text>
+          <Text style={styles.infoText}>
+            • Text mode: encrypts/decrypts strings. .bin format = [12-byte nonce][ciphertext][16-byte tag]
+          </Text>
+          <Text style={styles.infoText}>
+            • Media mode: encrypts any small file, embedding{' '}
+            <Text style={styles.infoBold}>filename + file bytes</Text> into the encrypted payload.
+          </Text>
+          <Text style={styles.infoText}>
+            • Outer .bin format is still [nonce][ciphertext][tag] – compatible with .NET / Python if they
+            treat everything after nonce as ciphertext+tag.
+          </Text>
+          <Text style={styles.infoText}>
+            • Decrypt Media: restores original filename + extension and saves to Downloads (Android) or
+            Documents (iOS).
+          </Text>
+          <Text style={styles.infoText}>
+            • Important: Never reuse the same key + nonce combination.
+          </Text>
+        </View>
+      </View>
+    </ScrollView>
+  );
+};
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#f8fafc',
+  },
+  content: {
+    padding: 20,
+    paddingBottom: 40,
+  },
+  title: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#1e293b',
+    textAlign: 'center',
+    marginBottom: 4,
+  },
+  subtitle: {
+    fontSize: 14,
+    color: '#64748b',
+    textAlign: 'center',
+    marginBottom: 24,
+  },
+  modeContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
+    gap: 16,
+  },
+  modeLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#334155',
+  },
+  modeToggle: {
+    flexDirection: 'row',
+    backgroundColor: '#e2e8f0',
+    borderRadius: 8,
+    padding: 4,
+  },
+  modeButton: {
+    paddingHorizontal: 20,
+    paddingVertical: 8,
+    borderRadius: 6,
+  },
+  modeButtonActive: {
+    backgroundColor: '#3b82f6',
+  },
+  modeButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#64748b',
+  },
+  modeButtonTextActive: {
+    color: '#ffffff',
+  },
+  inputGroup: {
+    marginBottom: 16,
+  },
+  label: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#334155',
+    marginBottom: 6,
+  },
+  labelRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  smallButton: {
+    backgroundColor: '#10b981',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 6,
+  },
+  smallButtonText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#ffffff',
+  },
+  textArea: {
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 14,
+    color: '#1e293b',
+    backgroundColor: '#ffffff',
+    minHeight: 100,
+    textAlignVertical: 'top',
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 14,
+    color: '#1e293b',
+    backgroundColor: '#ffffff',
+  },
+  hint: {
+    fontSize: 12,
+    marginTop: 4,
+  },
+  validHint: {
+    color: '#059669',
+  },
+  invalidHint: {
+    color: '#dc2626',
+  },
+  buttonRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 20,
+  },
+  importButton: {
+    backgroundColor: '#10b981',
+    paddingVertical: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  processButton: {
+    flex: 1,
+    backgroundColor: '#3b82f6',
+    paddingVertical: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  clearButton: {
+    backgroundColor: '#6b7280',
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  buttonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#ffffff',
+  },
+  disabledButton: {
+    opacity: 0.6,
+  },
+  outputContainer: {
+    backgroundColor: '#f1f5f9',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 8,
+    padding: 16,
+    marginBottom: 16,
+  },
+  outputLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#334155',
+    marginBottom: 8,
+  },
+  outputBox: {
+    backgroundColor: '#ffffff',
+    padding: 12,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  outputText: {
+    fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    color: '#1e293b',
+  },
+  filePath: {
+    fontSize: 11,
+    color: '#64748b',
+    marginTop: 8,
+    fontStyle: 'italic',
+    backgroundColor: '#f8fafc',
+    padding: 8,
+    borderRadius: 4,
+  },
+  tagContainer: {
+    backgroundColor: '#d1fae5',
+    borderWidth: 1,
+    borderColor: '#86efac',
+    borderRadius: 8,
+    padding: 16,
+    marginBottom: 16,
+  },
+  tagLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#065f46',
+    marginBottom: 8,
+  },
+  tagBox: {
+    backgroundColor: '#ffffff',
+    padding: 12,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#86efac',
+  },
+  tagText: {
+    fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    color: '#047857',
+  },
+  infoContainer: {
+    backgroundColor: '#e0f2fe',
+    borderWidth: 1,
+    borderColor: '#bae6fd',
+    borderRadius: 8,
+    padding: 16,
+    marginTop: 20,
+  },
+  infoTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#0369a1',
+    marginBottom: 8,
+  },
+  infoText: {
+    fontSize: 13,
+    color: '#0c4a6e',
+    lineHeight: 20,
+    marginBottom: 4,
+  },
+  infoBold: {
+    fontWeight: '600',
+  },
+});
+
+export default AesGcmScreen;
