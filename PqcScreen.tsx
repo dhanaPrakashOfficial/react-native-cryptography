@@ -12,6 +12,7 @@ import {
   PermissionsAndroid,
 } from 'react-native';
 
+import { pick, types } from '@react-native-documents/picker';
 import { Buffer } from 'buffer';
 import * as RNFS from 'react-native-fs';
 
@@ -21,33 +22,26 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import { gcm } from '@noble/ciphers/aes';
 
 /* =====================================================
-   RN-SAFE RANDOM BYTES
-===================================================== */
-const randomBytes = (length: number): Uint8Array => {
-  const bytes = new Uint8Array(length);
-  if (global.crypto?.getRandomValues) {
-    global.crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < length; i++) {
-      bytes[i] = Math.floor(Math.random() * 256);
-    }
-  }
-  return bytes;
-};
-
-/* =====================================================
-   CONSTANTS (MATCH PYTHON)
+   CONSTANTS (MUST MATCH PYTHON)
 ===================================================== */
 const SAMPLE_MESSAGE = 'Hello from React Native (Kyber + AES-GCM)!';
-const HKDF_SALT = new Uint8Array(32);
-const HKDF_INFO = new TextEncoder().encode('AES-256-GCM');
+
+const HKDF_SALT = new Uint8Array(32); // 32 × 0x00
+const HKDF_INFO = new Uint8Array(Buffer.from('AES-256-GCM', 'utf8'));
+
+const KYBER_PUBLIC_KEY_SIZE = 1568;
 
 /* =====================================================
    HELPERS
 ===================================================== */
-const concatBytes = (...arrays: Uint8Array[]) => {
-  const total = arrays.reduce((s, a) => s + a.length, 0);
-  const out = new Uint8Array(total);
+const randomBytes = (n: number): Uint8Array => {
+  const b = new Uint8Array(n);
+  global.crypto.getRandomValues(b);
+  return b;
+};
+
+const concatBytes = (...arrays: Uint8Array[]): Uint8Array => {
+  const out = new Uint8Array(arrays.reduce((s, a) => s + a.length, 0));
   let offset = 0;
   for (const a of arrays) {
     out.set(a, offset);
@@ -56,25 +50,25 @@ const concatBytes = (...arrays: Uint8Array[]) => {
   return out;
 };
 
-const deriveAesKey = (sharedSecret: Uint8Array) =>
+const deriveAesKey = (sharedSecret: Uint8Array): Uint8Array =>
   hkdf(sha256, sharedSecret, HKDF_SALT, HKDF_INFO, 32);
 
-const stringToBytes = (str: string): Uint8Array =>
-  new Uint8Array(Buffer.from(str, 'utf8'));
+const stringToBytes = (s: string): Uint8Array =>
+  new Uint8Array(Buffer.from(s, 'utf8'));
+
+const hex = (b: Uint8Array): string =>
+  Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+
+const preview = (b: Uint8Array, n = 16): string =>
+  hex(b.slice(0, n)) + ' …';
 
 /* =====================================================
    FILE HELPERS
 ===================================================== */
-
-const isoTimestamp = () =>
-  new Date().toISOString().replace(/:/g, '-').replace('T', '_').split('.')[0];
-
-const getDownloadDir = () => {
-  if (Platform.OS === 'android') {
-    return RNFS.DownloadDirectoryPath;
-  }
-  return RNFS.DocumentDirectoryPath;
-};
+const getDownloadDir = () =>
+  Platform.OS === 'android'
+    ? RNFS.DownloadDirectoryPath
+    : RNFS.DocumentDirectoryPath;
 
 const requestAndroidPermission = async () => {
   if (Platform.OS !== 'android') return true;
@@ -84,24 +78,47 @@ const requestAndroidPermission = async () => {
   return granted === PermissionsAndroid.RESULTS.GRANTED;
 };
 
-const writeBinaryFile = async (filename: string, bytes: Uint8Array) => {
-  const dir = getDownloadDir();
-  const path = `${dir}/${filename}`;
-  const base64 = Buffer.from(bytes).toString('base64');
-  await RNFS.writeFile(path, base64, 'base64');
+const writeBinaryFile = async (
+  filename: string,
+  bytes: Uint8Array,
+): Promise<string> => {
+  const path = `${getDownloadDir()}/${filename}`;
+  await RNFS.writeFile(
+    path,
+    Buffer.from(bytes).toString('base64'),
+    'base64',
+  );
   return path;
 };
+
+const readBin = async (uri: string): Promise<Uint8Array> =>
+  new Uint8Array(
+    Buffer.from(await RNFS.readFile(uri, 'base64'), 'base64'),
+  );
+
+/* =====================================================
+   OPTIONAL BASE64 FALLBACK (DEV ONLY)
+===================================================== */
+const PUBLIC_KEY_B64: string | null = null;
+const decodeBase64Key = (b64: string) =>
+  new Uint8Array(Buffer.from(b64, 'base64'));
 
 /* =====================================================
    SCREEN
 ===================================================== */
-
-const PUBLIC_KEY_B64 = null; // e.g., 'AAECAwQ...'
-
-const decodeBase64Key = b64 => new Uint8Array(Buffer.from(b64, 'base64'));
-
 export default function PqcEncryptScreen() {
   const [log, setLog] = useState('');
+
+  const logIt = (m: string) => {
+    console.log(m);
+    setLog(prev => prev + m + '\n');
+  };
+
+  const block = (title: string) => {
+    logIt('\n' + '='.repeat(70));
+    logIt(title);
+    logIt('='.repeat(70));
+  };
 
   useEffect(() => {
     (async () => {
@@ -111,79 +128,132 @@ export default function PqcEncryptScreen() {
           return;
         }
 
-        const L: string[] = [];
-        const logIt = (m: string) => {
-          console.log(m);
-          L.push(m);
-        };
-
         logIt('🚀 PQC Encryption — ML-KEM-1024 + AES-256-GCM');
-        logIt('================================================');
 
-        /* ---------- 1️⃣ LOAD OR GENERATE PUBLIC KEY ---------- */
+        /* =================================================
+           STEP 1: PUBLIC KEY
+        ================================================= */
+        block('STEP 1: PUBLIC KEY LOADING');
 
-        let publicKey: Uint8Array;
+        let publicKey: Uint8Array | null = null;
 
-        if (PUBLIC_KEY_B64) {
-          publicKey = decodeBase64Key(PUBLIC_KEY_B64);
-
-          if (publicKey.length !== 1568) {
-            throw new Error(
-              `Invalid public key length: ${publicKey.length} bytes (expected 1568)`,
-            );
-          }
-
-          logIt(`✓ Loaded public key from Base64 (${publicKey.length} bytes)`);
-        } else {
-          const keypair = ml_kem1024.keygen();
-          publicKey = keypair.publicKey;
-
-          logIt('⚠️ PUBLIC_KEY_B64 not set — generated demo keypair');
-          logIt(`✓ Generated public key: ${publicKey.length} bytes`);
+        try {
+          logIt('• Opening file picker');
+          const [file] = await pick({ type: [types.allFiles] });
+          const uri = (file as any).fileCopyUri ?? file.uri;
+          publicKey = await readBin(uri);
+          logIt('• Source              : File picker');
+        } catch {
+          logIt('• Picker skipped');
         }
 
-        /* ---------- 2️⃣ ENCAPSULATION ---------- */
-        const { cipherText, sharedSecret } = ml_kem1024.encapsulate(publicKey);
+        if (!publicKey) {
+          if (!PUBLIC_KEY_B64) {
+            throw new Error('No public key provided');
+          }
+          publicKey = decodeBase64Key(PUBLIC_KEY_B64);
+          logIt('• Source              : Base64 fallback');
+        }
 
-        /* ---------- 3️⃣ HKDF ---------- */
+        logIt(`• Public key size     : ${publicKey.length} bytes`);
+        logIt(`• Public key preview  : ${preview(publicKey)}`);
+        logIt(`• Public key SHA256   : ${hex(sha256(publicKey))}`);
+
+        if (publicKey.length !== KYBER_PUBLIC_KEY_SIZE) {
+          throw new Error('Invalid ML-KEM-1024 public key size');
+        }
+
+        /* =================================================
+           STEP 2: ML-KEM ENCAPSULATION
+        ================================================= */
+        block('STEP 2: ML-KEM-1024 ENCAPSULATION');
+
+        const { cipherText, sharedSecret } =
+          ml_kem1024.encapsulate(publicKey);
+
+        logIt(`• Kyber ciphertext size : ${cipherText.length}`);
+        logIt(`• Kyber CT preview      : ${preview(cipherText)}`);
+        logIt(`• Shared secret size    : ${sharedSecret.length}`);
+        logIt(`• Shared secret preview : ${preview(sharedSecret)}`);
+        logIt(`• Shared secret SHA256  : ${hex(sha256(sharedSecret))}`);
+
+        /* =================================================
+           STEP 3: HKDF
+        ================================================= */
+        block('STEP 3: HKDF-SHA256');
+
+        logIt(`• HKDF salt            : ${hex(HKDF_SALT)}`);
+        logIt(`• HKDF info            : ${Buffer.from(HKDF_INFO).toString('utf8')}`);
+
         const aesKey = deriveAesKey(sharedSecret);
 
-        /* ---------- 4️⃣ AES-GCM ---------- */
+        logIt(`• AES key size         : ${aesKey.length}`);
+        logIt(`• AES key preview      : ${preview(aesKey)}`);
+                logIt(`• AES key preview      : ${aesKey}`);
+
+        logIt(`• AES key SHA256       : ${hex(sha256(aesKey))}`);
+
+        /* =================================================
+           STEP 4: AES-GCM
+        ================================================= */
+        block('STEP 4: AES-256-GCM ENCRYPTION');
+
         const nonce = randomBytes(12);
-        const plaintextBytes = stringToBytes(SAMPLE_MESSAGE);
+        const plaintext = stringToBytes(SAMPLE_MESSAGE);
+        const encrypted = gcm(aesKey, nonce).encrypt(plaintext);
 
-        const cipher = gcm(aesKey, nonce);
-        const encrypted = cipher.encrypt(plaintextBytes);
+        const aesCiphertext = encrypted.slice(0, -16);
+        const tag = encrypted.slice(-16);
 
-        /* ---------- 5️⃣ FINAL PACKET ---------- */
-        const packet = concatBytes(cipherText, nonce, encrypted);
+        logIt(`• Plaintext            : "${SAMPLE_MESSAGE}"`);
+        logIt(`• Plaintext size       : ${plaintext.length}`);
+        logIt(`• Nonce                : ${hex(nonce)}`);
+        logIt(`• Ciphertext size      : ${aesCiphertext.length}`);
+        logIt(`• Ciphertext preview   : ${hex(aesCiphertext)}`);
+        logIt(`• Auth tag             : ${hex(tag)}`);
 
-        /* ---------- 6️⃣ SAVE FILES ---------- */
-        const ts = isoTimestamp();
+        /* =================================================
+           STEP 5: PACKET ASSEMBLY (CRITICAL)
+        ================================================= */
+        block('STEP 5: PACKET ASSEMBLY');
 
-        const pubKeyPath = await writeBinaryFile(
-          `${ts}_kyber_public.key`,
-          publicKey,
+        const packet = concatBytes(
+          cipherText, // 1568
+          nonce,      // 12
+          encrypted,  // ciphertext + tag
         );
 
+        logIt('• Packet layout        : [ kyber_ct | nonce | aes_cipher+tag ]');
+        logIt(`• Offset 0             : Kyber ciphertext`);
+        logIt(`• Offset 1568          : Nonce`);
+        logIt(`• Offset 1580          : AES ciphertext`);
+        logIt(`• Last 16 bytes        : AES-GCM tag`);
+        logIt(`• Packet total size    : ${packet.length}`);
+        logIt(`• Packet SHA256        : ${hex(sha256(packet))}`);
+
+        /* =================================================
+           STEP 6: FILE OUTPUT
+        ================================================= */
+        block('STEP 6: FILE OUTPUT');
+
+        const ts = Date.now();
+        const pubKeyPath = await writeBinaryFile(
+          `${ts}_kyber_public.bin`,
+          publicKey,
+        );
         const packetPath = await writeBinaryFile(
           `${ts}_encrypted_packet.bin`,
           packet,
         );
 
-        logIt('✅ FILES SAVED FOR PYTHON');
-        logIt(`Public key: ${pubKeyPath}`);
-        logIt(`Encrypted packet: ${packetPath}`);
+        logIt(`• Public key file      : ${pubKeyPath}`);
+        logIt(`• Encrypted packet     : ${packetPath}`);
+        logIt(`• Python input file    : encrypted_packet.bin`);
 
-        setLog(L.join('\n'));
-
-        Alert.alert(
-          'Success ✅',
-          `Files saved successfully:\n\n${pubKeyPath}\n${packetPath}`,
-        );
+        Alert.alert('Success ✅', 'Encryption complete');
       } catch (e: any) {
+        logIt(`❌ ERROR: ${e.message}`);
         Alert.alert('Error ❌', e.message);
-        setLog(`❌ ERROR\n${e.message}\n${e.stack ?? ''}`);
       }
     })();
   }, []);
