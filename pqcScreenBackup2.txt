@@ -1,0 +1,177 @@
+// MUST be first — required for PQC randomness
+import 'react-native-get-random-values';
+
+import React, { useEffect, useState } from 'react';
+import {
+  SafeAreaView,
+  ScrollView,
+  Text,
+  StyleSheet,
+  Platform,
+} from 'react-native';
+
+import { Buffer } from 'buffer';
+import { ml_kem1024 } from '@noble/post-quantum/ml-kem.js';
+import { hkdf } from '@noble/hashes/hkdf';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { gcm } from '@noble/ciphers/aes';
+
+/* =====================================================
+   RN-SAFE RANDOM BYTES (FROM YOUR WORKING CODE)
+===================================================== */
+const randomBytes = (length: number): Uint8Array => {
+  const bytes = new Uint8Array(length);
+  if (global.crypto?.getRandomValues) {
+    global.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return bytes;
+};
+
+/* =====================================================
+   CONSTANTS (MATCH PYTHON)
+===================================================== */
+
+const SAMPLE_MESSAGE = 'Hello from React Native (Kyber + AES-GCM)!';
+
+const HKDF_SALT = new Uint8Array(32); // 32 zero bytes
+const HKDF_INFO = new TextEncoder().encode('AES-256-GCM');
+
+/* =====================================================
+   HELPERS
+===================================================== */
+
+const concatBytes = (...arrays: Uint8Array[]) => {
+  const total = arrays.reduce((s, a) => s + a.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const a of arrays) {
+    out.set(a, offset);
+    offset += a.length;
+  }
+  return out;
+};
+
+const deriveAesKey = (sharedSecret: Uint8Array) =>
+  hkdf(sha256, sharedSecret, HKDF_SALT, HKDF_INFO, 32);
+
+const encodeBase64 = (bytes: Uint8Array) =>
+  Buffer.from(bytes).toString('base64');
+
+const stringToBytes = (str: string): Uint8Array =>
+  new Uint8Array(Buffer.from(str, 'utf8'));
+
+/* =====================================================
+   SCREEN
+===================================================== */
+
+export default function PqcEncryptScreen() {
+  const [log, setLog] = useState('');
+
+  useEffect(() => {
+    try {
+      const L: string[] = [];
+      const logIt = (m: string) => {
+        console.log(m);
+        L.push(m);
+      };
+
+      logIt('🚀 PQC Encryption — ML-KEM-1024 + AES-256-GCM');
+      logIt('================================================');
+
+      /* ---------- 1️⃣ KEYGEN ---------- */
+      logIt('1️⃣ Generating ML-KEM-1024 keypair...');
+      const { publicKey, secretKey } = ml_kem1024.keygen();
+      logIt(`✓ Public key: ${publicKey.length} bytes`);
+      logIt(`✓ Private key: ${secretKey.length} bytes`);
+
+      /* ---------- 2️⃣ ENCAPSULATION ---------- */
+      logIt('');
+      logIt('2️⃣ Encapsulating shared secret...');
+      const { cipherText, sharedSecret } =
+        ml_kem1024.encapsulate(publicKey);
+
+      logIt(`✓ Kyber ciphertext: ${cipherText.length} bytes`);
+      logIt(`✓ Shared secret: ${sharedSecret.length} bytes`);
+
+      /* ---------- 3️⃣ HKDF ---------- */
+      logIt('');
+      logIt('3️⃣ Deriving AES-256 key (HKDF-SHA256)...');
+      const aesKey = deriveAesKey(sharedSecret);
+      logIt(`✓ AES key length: ${aesKey.length} bytes`);
+
+      /* ---------- 4️⃣ AES-GCM ---------- */
+      logIt('');
+      logIt('4️⃣ AES-256-GCM encrypting...');
+      const nonce = randomBytes(12);
+      const plaintextBytes = stringToBytes(SAMPLE_MESSAGE);
+
+      logIt(`✓ Nonce length: ${nonce.length}`);
+      logIt(`✓ Plaintext length: ${plaintextBytes.length}`);
+
+      const cipher = gcm(aesKey, nonce);
+      const encrypted = cipher.encrypt(plaintextBytes); // ct || tag
+
+      const ciphertext = encrypted.slice(0, encrypted.length - 16);
+      const tag = encrypted.slice(encrypted.length - 16);
+
+      logIt(`✓ Ciphertext: ${ciphertext.length} bytes`);
+      logIt(`✓ Tag: ${tag.length} bytes`);
+
+      /* ---------- 5️⃣ FINAL PACKET ---------- */
+      logIt('');
+      logIt('5️⃣ Building final packet...');
+      const packet = concatBytes(cipherText, nonce, encrypted);
+
+      logIt('📦 PACKET FORMAT');
+      logIt('[ KyberCT(1568) | Nonce(12) | Ciphertext | Tag(16) ]');
+      logIt(`✓ Total packet size: ${packet.length} bytes`);
+
+      /* ---------- EXPORT ---------- */
+      logIt('');
+      logIt('📤 SEND TO PYTHON TEAM');
+      logIt('---------------------');
+      logIt('Public key (Base64):');
+      logIt(encodeBase64(publicKey));
+      logIt('');
+      logIt('Encrypted packet (Base64):');
+      logIt(encodeBase64(packet));
+      logIt('');
+      logIt('Plaintext:');
+      logIt(SAMPLE_MESSAGE);
+
+      setLog(L.join('\n'));
+    } catch (e: any) {
+      setLog(`❌ ERROR\n${e.message}\n${e.stack ?? ''}`);
+    }
+  }, []);
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <ScrollView>
+        <Text style={styles.mono}>{log}</Text>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+/* =====================================================
+   STYLES
+===================================================== */
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0b1224',
+    padding: 16,
+  },
+  mono: {
+    color: '#e8f0ff',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    fontSize: 13,
+    lineHeight: 20,
+  },
+});

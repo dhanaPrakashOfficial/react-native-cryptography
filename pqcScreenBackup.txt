@@ -1,0 +1,239 @@
+// MUST be first — required for Kyber randomness
+import 'react-native-get-random-values'
+
+import React, { useState } from 'react'
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  ScrollView,
+  Platform,
+  Alert,
+} from 'react-native'
+
+import { pick, types, errorCodes, isErrorWithCode } from '@react-native-documents/picker'
+import * as RNFS from 'react-native-fs'
+
+import { ml_kem512, ml_kem768, ml_kem1024 } from '@noble/post-quantum/ml-kem.js';
+
+import { hkdf } from '@noble/hashes/hkdf'
+import { sha256 } from '@noble/hashes/sha2.js'
+
+/* ===================== CONSTANTS ===================== */
+const KYBER_CT_LEN = 1568
+const KYBER_SK_LEN = 3168
+
+const HKDF_SALT = new Uint8Array(32) // 32 zero bytes
+const HKDF_INFO = new TextEncoder().encode('AES-256-GCM')
+
+/* ===================== BASE64 HELPERS ===================== */
+const base64ToBytes = (base64: string): Uint8Array => {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return bytes
+}
+
+const bytesToHex = (bytes: Uint8Array): string =>
+  Array.from(bytes)
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
+
+/* ===================== CRYPTO HELPERS ===================== */
+const deriveAesKey = (sharedSecret: Uint8Array) =>
+  hkdf(sha256, sharedSecret, HKDF_SALT, HKDF_INFO, 32)
+
+/* ===================== SCREEN ===================== */
+const PqcScreen = () => {
+  const [privateKey, setPrivateKey] = useState<Uint8Array | null>(null)
+  const [ciphertext, setCiphertext] = useState<Uint8Array | null>(null)
+
+  const [status, setStatus] = useState<string>('Pick required files')
+  const [aesKeyHex, setAesKeyHex] = useState<string | null>(null)
+
+  /* ---------------- PICK FILE (SAFE) ---------------- */
+  const pickFile = async (
+    label: string,
+    expectedLen: number,
+    setter: (b: Uint8Array) => void
+  ) => {
+    try {
+      const [file] = await pick({ type: [types.allFiles] })
+      if (!file) return
+
+      const uri = (file as any).fileCopyUri ?? file.uri
+      const base64 = await RNFS.readFile(uri, 'base64')
+      const bytes = base64ToBytes(base64)
+
+      console.log(`\n==== ${label} ====`)
+      console.log('Path:', uri)
+      console.log('Length:', bytes.length)
+
+      if (bytes.length !== expectedLen) {
+        throw new Error(`${label} must be exactly ${expectedLen} bytes`)
+      }
+
+      setter(bytes)
+      setStatus(`✓ ${label} loaded`)
+    } catch (err: any) {
+      if (isErrorWithCode(err) && err.code === errorCodes.OPERATION_CANCELED) {
+        return
+      }
+      setStatus(`✗ Failed to load ${label}`)
+      console.error(err)
+    }
+  }
+
+  /* ---------------- DECAPSULATION ---------------- */
+  const runDecapsulation = () => {
+    if (!privateKey || !ciphertext) {
+      setStatus('✗ Pick both private key and ciphertext')
+      return
+    }
+
+    try {
+      setStatus('Running Kyber decapsulation…')
+      console.log('\n🔐 ml_kem1024 Decapsulation started')
+
+      // 1) Kyber decapsulation
+      const sharedSecret = ml_kem1024.decapsulate(ciphertext, privateKey)
+
+      console.log('Shared secret length:', sharedSecret.length)
+
+      // 2) HKDF → AES-256 key
+      const aesKey = deriveAesKey(sharedSecret)
+      const aesHex = bytesToHex(aesKey)
+
+      console.log('AES-256 key derived:', aesHex)
+
+      setAesKeyHex(aesHex)
+      setStatus('✓ AES-256 key derived successfully')
+
+      // Safe place for Alert (after all async work)
+      setTimeout(() => {
+        Alert.alert(
+          'Success',
+          'Kyber decapsulation completed.\nAES-256 key derived.\nCheck console.'
+        )
+      }, 300)
+    } catch (err: any) {
+      console.error('❌ Decapsulation failed:', err)
+      setStatus('✗ Decapsulation failed')
+    }
+  }
+
+  /* ===================== UI ===================== */
+  return (
+    <ScrollView contentContainerStyle={styles.container}>
+      <Text style={styles.title}>🔐 PQC – Kyber Decapsulation</Text>
+
+      <TouchableOpacity
+        style={styles.button}
+        onPress={() =>
+          pickFile('Kyber Private Key', KYBER_SK_LEN, setPrivateKey)
+        }
+      >
+        <Text style={styles.buttonText}>🔑 Pick Kyber Private Key (.key)</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        style={styles.button}
+        onPress={() =>
+          pickFile('Kyber Ciphertext', KYBER_CT_LEN, setCiphertext)
+        }
+      >
+        <Text style={styles.buttonText}>📦 Pick Kyber Ciphertext (.bin)</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity
+        style={styles.decryptButton}
+        onPress={runDecapsulation}
+      >
+        <Text style={styles.buttonText}>▶️ Run Decapsulation</Text>
+      </TouchableOpacity>
+
+      {/* STATUS */}
+      <View style={styles.statusBox}>
+        <Text style={styles.statusText}>{status}</Text>
+      </View>
+
+      {/* AES KEY OUTPUT */}
+      {aesKeyHex && (
+        <View style={styles.outputBox}>
+          <Text style={styles.outputLabel}>Derived AES-256 Key (Hex)</Text>
+          <Text selectable style={styles.outputText}>
+            {aesKeyHex}
+          </Text>
+        </View>
+      )}
+    </ScrollView>
+  )
+}
+
+export default PqcScreen
+
+/* ===================== STYLES ===================== */
+const styles = StyleSheet.create({
+  container: {
+    flexGrow: 1,
+    backgroundColor: '#f8fafc',
+    padding: 20,
+    justifyContent: 'center',
+  },
+  title: {
+    fontSize: 22,
+    fontWeight: 'bold',
+    textAlign: 'center',
+    marginBottom: 32,
+  },
+  button: {
+    backgroundColor: '#3b82f6',
+    paddingVertical: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  decryptButton: {
+    backgroundColor: '#10b981',
+    paddingVertical: 14,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  buttonText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  statusBox: {
+    marginTop: 20,
+    padding: 12,
+    backgroundColor: '#e5e7eb',
+    borderRadius: 6,
+  },
+  statusText: {
+    textAlign: 'center',
+    fontSize: 13,
+    color: '#111827',
+  },
+  outputBox: {
+    marginTop: 24,
+    backgroundColor: '#ffffff',
+    padding: 16,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+  },
+  outputLabel: {
+    fontWeight: '600',
+    marginBottom: 8,
+  },
+  outputText: {
+    fontSize: 12,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    color: '#1e293b',
+  },
+})
